@@ -39,6 +39,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -47,6 +48,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -2483,13 +2486,27 @@ func (r *BareMetalHostReconciler) updateEventHandler(e event.UpdateEvent) bool {
 
 // SetupWithManager registers the reconciler to be run by the manager.
 func (r *BareMetalHostReconciler) SetupWithManager(mgr ctrl.Manager, preprovImgEnable bool, maxConcurrentReconcile int) error {
+	// Cap the exponential backoff at 30 seconds instead of the default 1000 seconds.
+	// Without this cap, transient "no endpoints available" errors on the BMO validating
+	// webhook (which occur during the brief window between BMO becoming ready and its
+	// Service endpoint being propagated) can push the rate limiter to its maximum delay.
+	// At the 1000s cap a single such burst locks out BareMetalHost reconciliation for
+	// up to ~16 minutes after the webhook becomes reachable.
+	rateLimiter := workqueue.NewTypedMaxOfRateLimiter(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](5*time.Millisecond, 30*time.Second),
+		&workqueue.TypedBucketRateLimiter[reconcile.Request]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+	)
+
 	controller := ctrl.NewControllerManagedBy(mgr).
 		For(&metal3api.BareMetalHost{}).
 		WithEventFilter(
 			predicate.Funcs{
 				UpdateFunc: r.updateEventHandler,
 			}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconcile}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: maxConcurrentReconcile,
+			RateLimiter:             rateLimiter,
+		}).
 		Owns(&corev1.Secret{}, builder.MatchEveryOwner)
 
 	if preprovImgEnable {
