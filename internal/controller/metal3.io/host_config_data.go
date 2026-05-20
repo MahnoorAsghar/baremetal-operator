@@ -9,8 +9,23 @@ import (
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	"github.com/metal3-io/baremetal-operator/pkg/secretutils"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 )
+
+// hostInDeletionFlow reports whether the host is being removed. During this
+// window a missing preprovisioning network Secret should not block progress.
+func hostInDeletionFlow(host *metal3api.BareMetalHost) bool {
+	if !host.DeletionTimestamp.IsZero() {
+		return true
+	}
+	switch host.Status.Provisioning.State {
+	case metal3api.StateDeleting, metal3api.StatePoweringOffBeforeDelete:
+		return true
+	default:
+		return false
+	}
+}
 
 // hostConfigData is an implementation of host configuration data interface.
 // Object is able to retrieve data from secrets referenced in a host spec.
@@ -107,20 +122,43 @@ func (hcd *hostConfigData) PreprovisioningNetworkData(ctx context.Context) (stri
 	if hcd.host.Spec.PreprovisioningNetworkDataName == "" {
 		return "", nil
 	}
-	networkDataRaw, err := hcd.getSecretData(
-		ctx,
-		hcd.host.Spec.PreprovisioningNetworkDataName,
-		hcd.host.Namespace,
-		"networkData",
-	)
+	networkDataRaw, err := hcd.getPreprovisioningNetworkDataFromSecret(ctx)
 	if err != nil {
 		var noDataErr NoDataInSecretError
 		if errors.As(err, &noDataErr) {
 			hcd.log.Info("PreprovisioningNetworkData networkData key is not set, returning empty data")
 			return "", nil
 		}
+		if k8serrors.IsNotFound(err) && hostInDeletionFlow(hcd.host) {
+			hcd.log.Info("PreprovisioningNetworkData secret not found during host deletion, returning empty data")
+			return "", nil
+		}
 	}
 	return networkDataRaw, err
+}
+
+func (hcd *hostConfigData) getPreprovisioningNetworkDataFromSecret(ctx context.Context) (string, error) {
+	key := types.NamespacedName{
+		Name:      hcd.host.Spec.PreprovisioningNetworkDataName,
+		Namespace: hcd.host.Namespace,
+	}
+
+	addFinalizer := hcd.host.Status.Provisioning.State != metal3api.StateDeleting
+	secret, err := hcd.secretManager.ObtainSecretWithFinalizer(ctx, key, addFinalizer)
+	if err != nil {
+		return "", err
+	}
+
+	data, ok := secret.Data["networkData"]
+	if ok {
+		return string(data), nil
+	}
+	if data, ok = secret.Data["value"]; !ok {
+		hostConfigDataError.WithLabelValues("networkData").Inc()
+		return "", NoDataInSecretError{secret: key.Name, key: "networkData"}
+	}
+
+	return string(data), nil
 }
 
 // MetaData get host metatdata.
